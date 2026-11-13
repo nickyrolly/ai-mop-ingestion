@@ -12,6 +12,7 @@ const (
 	DefaultDim         = 1024
 	DefaultDSN         = "postgres://postgres:postgres@localhost:5433/aimop_rag?sslmode=disable"
 	DefaultTable       = "knowledge_chunks"
+	DefaultJobs        = 4
 )
 
 // Nama environment variable.
@@ -21,6 +22,8 @@ const (
 	EnvEmbeddingDim = "EMBEDDING_DIM"
 	EnvPGDSN        = "PG_DSN"
 	EnvKBDir        = "AI_MOP_KB_DIR"
+	EnvSQLTable     = "AI_MOP_TABLE"
+	EnvJobs         = "AI_MOP_JOBS"
 )
 
 // Config mengontrol perilaku ingestion, embedding, dan penyimpanan.
@@ -31,11 +34,12 @@ type Config struct {
 	PGDSN        string
 	KBDir        string
 	SQLTable     string
+	Jobs         int
 }
 
-// OllamaEmbeddingsURL mereturn endpoint /api/embeddings Ollama.
-func (c Config) OllamaEmbeddingsURL() string {
-	return c.OllamaURL + "/api/embeddings"
+// OllamaEmbedURL mereturn endpoint /api/embed Ollama.
+func (c Config) OllamaEmbedURL() string {
+	return c.OllamaURL + "/api/embed"
 }
 
 // FromEnv membangun Config dari environment variable, pakai default jika kosong.
@@ -46,6 +50,7 @@ func FromEnv() Config {
 		EmbeddingDim: DefaultDim,
 		PGDSN:        DefaultDSN,
 		SQLTable:     DefaultTable,
+		Jobs:         DefaultJobs,
 	}
 	if v := os.Getenv(EnvOllamaURL); v != "" {
 		cfg.OllamaURL = v
@@ -63,6 +68,14 @@ func FromEnv() Config {
 	}
 	if v := os.Getenv(EnvKBDir); v != "" {
 		cfg.KBDir = v
+	}
+	if v := os.Getenv(EnvSQLTable); v != "" {
+		cfg.SQLTable = v
+	}
+	if v := os.Getenv(EnvJobs); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Jobs = n
+		}
 	}
 	return cfg
 }

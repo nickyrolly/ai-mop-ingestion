@@ -6,14 +6,17 @@ package main
 import (
 	"context"
 	"os"
-	"time"
+	"os/signal"
+	"syscall"
 
 	"ai-mop-ingestion/internal/cli"
 )
 
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	defer cancel()
+	// Ctrl+C / SIGTERM membatalkan ingest dengan rapi (transaksi per file
+	// di-rollback), tanpa deadline buatan yang memotong ingest besar.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	os.Exit(cli.Run(ctx, os.Args[1:], os.Stdout))
 }

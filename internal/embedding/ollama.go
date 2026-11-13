@@ -1,4 +1,5 @@
-// Package embedding menyediakan client HTTP ke Ollama /api/embeddings.
+// Package embedding menyediakan client HTTP ke endpoint embedding Ollama
+// (/api/embed), dengan dukungan batch agar tidak perlu satu request per chunk.
 package embedding
 
 import (
@@ -12,38 +13,68 @@ import (
 	"time"
 )
 
-// Client mightyembedding Ollama.
+// MaxBatch jumlah teks maksimum per request ke Ollama.
+const MaxBatch = 16
+
+// Client membungkus endpoint embedding Ollama.
 type Client struct {
-	Endpoint string // URL penuh /api/embeddings
+	Endpoint string // URL penuh /api/embed
 	Model    string
 	Dim      int
 	hc       *http.Client
 }
 
-// NewClient membuat client embedding Ollama.
-func NewClient(endpoint, model string, dim int) *Client {
+// NewClient membuat client embedding Ollama. baseURL contoh: http://localhost:11434
+func NewClient(baseURL, model string, dim int) *Client {
 	return &Client{
-		Endpoint: endpoint,
+		Endpoint: strings.TrimRight(baseURL, "/") + "/api/embed",
 		Model:    model,
 		Dim:      dim,
-		hc:       &http.Client{Timeout: 120 * time.Second},
+		hc:       &http.Client{Timeout: 300 * time.Second},
 	}
 }
 
 type requestPayload struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
+	Model string   `json:"model"`
+	Input []string `json:"input"`
 }
 
-type embeddingsResponse struct {
-	Embedding []float32 `json:"embedding"`
+type embedResponse struct {
+	Embeddings [][]float32 `json:"embeddings"`
 }
 
-// Embed mengirim prompt ke Ollama dan mereturn vektor embedding.
-// Error dikembalikan bila HTTP gagal, status bukan 200, JSON tidak bisa
-// didecode, atau dimensi vektor berbeda dari konfigurasi.
+// Embed mengirim satu prompt ke Ollama dan mereturn vektor embedding.
 func (c *Client) Embed(ctx context.Context, prompt string) ([]float32, error) {
-	payload, err := json.Marshal(requestPayload{Model: c.Model, Prompt: prompt})
+	vecs, err := c.EmbedBatch(ctx, []string{prompt})
+	if err != nil {
+		return nil, err
+	}
+	return vecs[0], nil
+}
+
+// EmbedBatch mengirim sekumpulan prompt (dipecah per MaxBatch) dan mereturn
+// vektor untuk masing-masing prompt, berurutan sesuai input.
+func (c *Client) EmbedBatch(ctx context.Context, prompts []string) ([][]float32, error) {
+	if len(prompts) == 0 {
+		return nil, nil
+	}
+	out := make([][]float32, 0, len(prompts))
+	for start := 0; start < len(prompts); start += MaxBatch {
+		end := start + MaxBatch
+		if end > len(prompts) {
+			end = len(prompts)
+		}
+		vecs, err := c.embedOnce(ctx, prompts[start:end])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, vecs...)
+	}
+	return out, nil
+}
+
+func (c *Client) embedOnce(ctx context.Context, prompts []string) ([][]float32, error) {
+	payload, err := json.Marshal(requestPayload{Model: c.Model, Input: prompts})
 	if err != nil {
 		return nil, fmt.Errorf("encode payload: %w", err)
 	}
@@ -65,13 +96,19 @@ func (c *Client) Embed(ctx context.Context, prompt string) ([]float32, error) {
 		return nil, fmt.Errorf("Ollama status %s: %s", resp.Status, strings.TrimSpace(string(msg)))
 	}
 
-	var out embeddingsResponse
+	var out embedResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode respons Ollama: %w", err)
 	}
-	if len(out.Embedding) != c.Dim {
-		return nil, fmt.Errorf("dimensi embedding %d tidak sama dengan konfigurasi %d",
-			len(out.Embedding), c.Dim)
+	if len(out.Embeddings) != len(prompts) {
+		return nil, fmt.Errorf("Ollama mereturn %d vektor untuk %d input",
+			len(out.Embeddings), len(prompts))
 	}
-	return out.Embedding, nil
+	for i, v := range out.Embeddings {
+		if len(v) != c.Dim {
+			return nil, fmt.Errorf("dimensi embedding ke-%d = %d, tidak sama dengan konfigurasi %d",
+				i+1, len(v), c.Dim)
+		}
+	}
+	return out.Embeddings, nil
 }

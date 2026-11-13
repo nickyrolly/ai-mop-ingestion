@@ -1,0 +1,11 @@
+# binary hasil build
+/ai-mop-ingestion
+
+# artefak test & profil
+*.test
+*.out
+coverage.*
+
+# lokal
+.env
+.DS_Store
