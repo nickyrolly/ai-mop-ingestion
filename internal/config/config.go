@@ -4,6 +4,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 const (
@@ -13,6 +14,7 @@ const (
 	DefaultDSN         = "postgres://postgres:postgres@localhost:5433/aimop_rag?sslmode=disable"
 	DefaultTable       = "knowledge_chunks"
 	DefaultJobs        = 4
+	DefaultCTLMode     = false
 )
 
 // Nama environment variable.
@@ -24,6 +26,7 @@ const (
 	EnvKBDir        = "AI_MOP_KB_DIR"
 	EnvSQLTable     = "AI_MOP_TABLE"
 	EnvJobs         = "AI_MOP_JOBS"
+	EnvCTL          = "AI_MOP_CTL"
 )
 
 // Config mengontrol perilaku ingestion, embedding, dan penyimpanan.
@@ -35,6 +38,7 @@ type Config struct {
 	KBDir        string
 	SQLTable     string
 	Jobs         int
+	CTLMode      bool
 }
 
 // OllamaEmbedURL mereturn endpoint /api/embed Ollama.
@@ -51,6 +55,7 @@ func FromEnv() Config {
 		PGDSN:        DefaultDSN,
 		SQLTable:     DefaultTable,
 		Jobs:         DefaultJobs,
+		CTLMode:      DefaultCTLMode,
 	}
 	if v := os.Getenv(EnvOllamaURL); v != "" {
 		cfg.OllamaURL = v
@@ -76,6 +81,10 @@ func FromEnv() Config {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.Jobs = n
 		}
+	}
+	if v := os.Getenv(EnvCTL); v != "" {
+		v = strings.ToLower(strings.TrimSpace(v))
+		cfg.CTLMode = (v == "1" || v == "true" || v == "yes" || v == "on")
 	}
 	return cfg
 }

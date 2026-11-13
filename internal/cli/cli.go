@@ -63,7 +63,7 @@ Penggunaan:
   ai-mop-ingestion ingest [-dir PATH] [-v] [-force]    Ingest rekursif semua *.md
   ai-mop-ingestion search "query" [-k 3] [-json]       Pencarian hybrid (vektor + kata kunci)
                      [-tenant ID] [-category NAMA]
-                     [-min-score 0.50] [-per-doc 2]
+                     [-min-score 0.50] [-per-doc 2] [-ctl]
   ai-mop-ingestion version                             Tampilkan versi
 
 Opsi ingest:
@@ -75,6 +75,7 @@ Opsi search:
   -k N          jumlah hasil akhir (default 3, maks 50)
   -min-score X  ambang cosine 0..1 untuk hit vektor; 0 = nonaktif (default 0.50)
   -per-doc N    maksimum chunk per dokumen di hasil akhir; 0 = tanpa batas (default 2)
+  -ctl          keluaran ringkas mode kontrol (anchor <=50 char, hemat token prompt)
   -json         keluaran JSON
 
 Kode keluar search: 0 ada hasil, 3 tidak ada hasil yang lolos gerbang skor.
@@ -87,6 +88,7 @@ Konfigurasi environment variable:
   AI_MOP_KB_DIR   (default: folder knowledge-base terdekat)
   AI_MOP_TABLE    (default: knowledge_chunks)
   AI_MOP_JOBS     (default: 4, jumlah request embedding paralel)
+  AI_MOP_CTL      (default: false, set true untuk mengaktifkan mode CTL secara global)
 `)
 }
 
@@ -471,6 +473,7 @@ func runSearch(ctx context.Context, cfg config.Config, args []string, w io.Write
 	// arg posisi pertama, jadi scan manual semua arg.
 	opt := store.SearchOptions{TopK: 3, MinScore: 0.50, MaxPerDoc: 2}
 	asJSON := false
+	ctlMode := cfg.CTLMode
 	var qparts []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -512,6 +515,10 @@ func runSearch(ctx context.Context, cfg config.Config, args []string, w io.Write
 			}
 		case strings.HasPrefix(a, "-category="):
 			opt.Category = strings.TrimPrefix(a, "-category=")
+		case a == "-ctl" || a == "--ctl":
+			ctlMode = true
+		case a == "-no-ctl" || a == "--no-ctl":
+			ctlMode = false
 		case a == "-json" || a == "--json":
 			asJSON = true
 		case strings.HasPrefix(a, "-"):
@@ -557,18 +564,100 @@ func runSearch(ctx context.Context, cfg config.Config, args []string, w io.Write
 		// Bedakan "tidak ada yang relevan" dari kesalahan: agent pemanggil
 		// harus tahu kapan berhenti dan bertanya, bukan mengarang jawaban.
 		if asJSON {
-			printJSON(w, query, res, opt)
+			if ctlMode {
+				printCTLJSON(w, query, res, opt)
+			} else {
+				printJSON(w, query, res, opt)
+			}
 		} else {
 			fmt.Fprintf(w, "\n🔎 %q → tidak ada dokumen relevan (ambang cosine %.2f)\n", query, opt.MinScore)
 		}
 		return 3
 	}
 	if asJSON {
-		printJSON(w, query, res, opt)
+		if ctlMode {
+			printCTLJSON(w, query, res, opt)
+		} else {
+			printJSON(w, query, res, opt)
+		}
 	} else {
-		printResults(w, query, res)
+		if ctlMode {
+			printCTLResults(w, query, res)
+		} else {
+			printResults(w, query, res)
+		}
 	}
 	return 0
+}
+
+func printCTLResults(w io.Writer, query string, results []store.Result) {
+	fmt.Fprintf(w, "\n🔎 %q → %d hasil [mode: ctl]\n\n", query, len(results))
+	medals := []string{"🥇", "🥈", "🥉"}
+	for i, r := range results {
+		rank := fmt.Sprintf("%d.", i+1)
+		if i < len(medals) {
+			rank = medals[i]
+		}
+		doc := r.SourceFile
+		if r.DocID != "" {
+			doc = r.DocID + " (" + r.SourceFile + ")"
+		}
+		kw := ""
+		if r.TextMatched() {
+			kw = fmt.Sprintf(" +kata kunci %.3f", r.TextRank)
+		}
+		fmt.Fprintf(w, "%s [rrf %.4f | cosine %.4f%s] %s — §%s [%s]\n    anchor: %q\n\n",
+			rank, r.Score, r.Similarity, kw, doc, r.SectionTitle, r.Category, anchor(r.Content))
+	}
+}
+
+func printCTLJSON(w io.Writer, query string, results []store.Result, opt store.SearchOptions) {
+	type ctlRow struct {
+		Rank         int     `json:"rank"`
+		Score        float64 `json:"score"`
+		Similarity   float64 `json:"similarity"`
+		TextMatch    bool    `json:"text_match"`
+		TextRank     float64 `json:"text_rank,omitempty"`
+		SourceFile   string  `json:"source_file"`
+		DocID        string  `json:"doc_id,omitempty"`
+		DocTitle     string  `json:"doc_title,omitempty"`
+		SectionTitle string  `json:"section_title"`
+		Category     string  `json:"category,omitempty"`
+		Tenant       string  `json:"tenant_id"`
+		Anchor       string  `json:"anchor"`
+		UpdatedAt    string  `json:"updated_at"`
+	}
+	rows := make([]ctlRow, 0, len(results))
+	for i, r := range results {
+		rows = append(rows, ctlRow{
+			Rank:         i + 1,
+			Score:        round4(float64(r.Score)),
+			Similarity:   round4(float64(r.Similarity)),
+			TextMatch:    r.TextMatched(),
+			TextRank:     round4(float64(r.TextRank)),
+			SourceFile:   r.SourceFile,
+			DocID:        r.DocID,
+			DocTitle:     r.DocTitle,
+			SectionTitle: r.SectionTitle,
+			Category:     r.Category,
+			Tenant:       r.TenantID,
+			Anchor:       anchor(r.Content),
+			UpdatedAt:    r.UpdatedAt.Format(time.RFC3339),
+		})
+	}
+	buf, err := json.MarshalIndent(struct {
+		Query    string   `json:"query"`
+		Total    int      `json:"total"`
+		Mode     string   `json:"mode"`
+		MinScore float64  `json:"min_score"`
+		PerDoc   int      `json:"per_doc"`
+		Results  []ctlRow `json:"results"`
+	}{query, len(rows), "ctl", round4(float64(opt.MinScore)), opt.MaxPerDoc, rows}, "", "  ")
+	if err != nil {
+		fmt.Fprintf(w, "error: marshal json: %v\n", err)
+		return
+	}
+	fmt.Fprintln(w, string(buf))
 }
 
 func printResults(w io.Writer, query string, results []store.Result) {
@@ -649,6 +738,15 @@ func snippet(s string) string {
 	s = strings.Join(strings.Fields(s), " ")
 	if len(s) > 220 {
 		s = s[:220] + "…"
+	}
+	return s
+}
+
+// anchor memangkas teks menjadi frasa jangkar pendek (<= 50 karakter) untuk mode CTL.
+func anchor(s string) string {
+	s = strings.TrimSpace(strings.Join(strings.Fields(s), " "))
+	if len(s) > 50 {
+		return s[:47] + "..."
 	}
 	return s
 }
