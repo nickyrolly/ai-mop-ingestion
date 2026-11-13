@@ -9,3 +9,6 @@ coverage.*
 # lokal
 .env
 .DS_Store
+
+# hasil benchmark lokal
+eval/out/
