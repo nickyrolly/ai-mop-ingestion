@@ -36,6 +36,15 @@ go vet ./...
 go test ./...
 ```
 
+## Alur branch
+
+- Semua perubahan (kode, eval, dokumentasi) diajukan lewat branch baru dari
+  **`staging`** dan PR dengan base **`staging`** — bukan `main`.
+- Merge `staging` → `main` hanya dilakukan owner; agent tidak merge PR.
+- Binary hasil build **tidak** di-commit (lihat `.gitignore`). Riwayat repo
+  pernah memuat binary 16 MB; blob itu sudah dihapus dari seluruh riwayat
+  (clone bersih ±164 KB).
+
 ## Penggunaan
 
 ```sh
