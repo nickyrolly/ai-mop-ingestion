@@ -103,6 +103,25 @@ func TestFindKBRoot(t *testing.T) {
 	}
 }
 
+func TestResolveKBDirExplicitMissing(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "tidak-ada")
+	if _, err := resolveKBDir(missing, ""); err == nil {
+		t.Fatal("-dir yang tidak ada harus error, bukan jatuh ke kandidat default")
+	}
+	if _, err := resolveKBDir("", missing); err == nil {
+		t.Fatal("AI_MOP_KB_DIR yang tidak ada harus error")
+	}
+
+	dir := t.TempDir()
+	got, err := resolveKBDir(dir, "")
+	if err != nil {
+		t.Fatalf("resolveKBDir(dir): %v", err)
+	}
+	if got != dir {
+		t.Errorf("resolveKBDir = %q, want %q", got, dir)
+	}
+}
+
 func mustWrite(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

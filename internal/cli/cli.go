@@ -96,16 +96,23 @@ var kbDirCandidates = []string{
 }
 
 func resolveKBDir(flagDir, envDir string) (string, error) {
-	cands := []string{}
+	// Path yang diberikan eksplisit (flag atau env) tidak boleh diam-diam
+	// dialihkan ke kandidat default — itu bisa meng-ingest folder yang salah.
 	if flagDir != "" {
-		cands = append(cands, flagDir)
+		if _, err := os.Stat(flagDir); err != nil {
+			return "", fmt.Errorf("path -dir tidak ditemukan: %s", flagDir)
+		}
+		abs, _ := filepath.Abs(flagDir)
+		return abs, nil
 	}
 	if envDir != "" {
-		cands = append(cands, envDir)
+		if _, err := os.Stat(envDir); err != nil {
+			return "", fmt.Errorf("AI_MOP_KB_DIR tidak ditemukan: %s", envDir)
+		}
+		abs, _ := filepath.Abs(envDir)
+		return abs, nil
 	}
-	cands = append(cands, kbDirCandidates...)
-
-	for _, c := range cands {
+	for _, c := range kbDirCandidates {
 		if _, err := os.Stat(c); err == nil {
 			abs, _ := filepath.Abs(c)
 			return abs, nil
@@ -261,9 +268,11 @@ func runIngest(ctx context.Context, cfg config.Config, args []string, w io.Write
 		emb.Endpoint, cfg.OllamaModel, cfg.EmbeddingDim, cfg.Jobs)
 
 	stats := ingestStats{start: time.Now()}
+	canceled := false
 	for _, path := range files {
 		if ctx.Err() != nil {
 			fmt.Fprintln(w, "⚠️  dibatalkan oleh sinyal/timeout")
+			canceled = true
 			break
 		}
 		id := sourceID(root, path)
@@ -296,6 +305,9 @@ func runIngest(ctx context.Context, cfg config.Config, args []string, w io.Write
 	fmt.Fprintf(w, "⏱  %d file diproses, %d skip, %d gagal — %d chunk tersimpan, %d chunk di-embed dalam %s\n",
 		stats.files, stats.skipped, stats.failed, stats.chunks, stats.embedded,
 		time.Since(stats.start).Round(time.Millisecond))
+	if canceled {
+		return 130 // konvensi SIGINT; kegagalan file akibat cancel bukan error data
+	}
 	if stats.failed > 0 {
 		return 1
 	}
