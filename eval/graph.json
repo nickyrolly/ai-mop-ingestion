@@ -1,0 +1,16 @@
+{
+  "q01": { "ms": 50, "docs": ["runbooks/RB-WP-001-health-check.md", "vendors/dpanel/2026-11-02-cloudflare-wordpress-custom-hostname.md"] },
+  "q02": { "ms": 30, "docs": ["learnings/2026-11-03-seo-recovery-pn-koba.md"] },
+  "q03": { "ms": 40, "docs": ["runbooks/RB-WP-003-plugin-update.md", "runbooks/RB-WP-002-backup-verify.md", "operations/playbooks/PB-WP-006-plugin-update.yaml"] },
+  "q04": { "ms": 35, "docs": ["learnings/2026-11-11-rancangan-layanan-maintenance-wordpress.md", "learnings/2026-11-03-wordpress-maintenance-mvp.md"] },
+  "q05": { "ms": 25, "docs": ["patterns/canonical-cases/CC-WP-001-wordpress-compromise.md"] },
+  "q06": { "ms": 45, "docs": ["runbooks/RB-WP-002-backup-verify.md", "runbooks/RB-WP-003-plugin-update.md"] },
+  "q07": { "ms": 20, "docs": ["runbooks/RB-WP-003-plugin-update.md"] },
+  "q08": { "ms": 30, "docs": ["patterns/canonical-cases/CC-WP-002-php-cve-patch.md", "operations/playbooks/PB-WP-003-php-patch.yaml"] },
+  "q09": { "ms": 40, "docs": ["learnings/2026-11-04-sipp-codeigniter2-deploy-traps.md", "operations/runs/2026-11-04-sipp-7.0.6-deploy.md"] },
+  "q10": { "ms": 25, "docs": ["runbooks/RB-WP-001-health-check.md", "knowledge-base/vendors/cloudflare/2026-11-02-zone-audit.md"] },
+  "q11": { "ms": 35, "docs": ["knowledge-base/vendors/cloudflare/2026-11-02-wordpress-custom-domain-dpanel.md", "knowledge-base/learnings/2026-11-02-cloudflare-free-setup-public-site.md"] },
+  "q12": { "ms": 30, "docs": ["learnings/2026-11-11-survey-harga-pasaran-website-2026.md", "clients/rizal/estimation-daster.md"] },
+  "q13": { "ms": 20, "docs": ["learnings/2026-11-10-high-rps-json-processing-and-cache-locality.md"] },
+  "q14": { "ms": 30, "docs": ["learnings/2026-11-13-rag-hybrid-retrieval-gerbang-skor-dan-benchmark.md", "learnings/2026-11-02-rag-plan-implementasi.md"] }
+}

@@ -11,9 +11,18 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// MaxChunkChars batas lunak panjang teks chunk sebelum dikirim ke model
-// embedding (bge-m3 punya konteks 8192 token).
+// MaxChunkChars batas panjang teks yang dikirim ke model embedding
+// (bge-m3 punya konteks 8192 token). Section yang lebih panjang dipecah,
+// bukan dipotong diam-diam.
 const MaxChunkChars = 7000
+
+// ChunkOverlapChars jumlah byte yang diulang di batas potongan supaya konsep
+// yang jatuh di tengah section tetap ada di salah satu vektor.
+const ChunkOverlapChars = 500
+
+// sectionPartReserve ruang judul untuk sufiks " (bagian i/n)" saat menghitung
+// anggaran isi, supaya potongan tidak melebihi MaxChunkChars setelah diberi judul.
+const sectionPartReserve = 32
 
 // bk3 adalah tiga backtick ("```") sebagai konstanta, agar tidak ada literal
 // backtick di dalam source Go.
@@ -92,8 +101,10 @@ type Chunk struct {
 	DocTitle     string // judul dokumen
 	SectionTitle string // heading chunk, sudah berbentuk breadcrumb "H2 > H3"
 	Content      string // isi section (tanpa baris heading)
-	Category     string // inferensi dari path file
-	TenantID     string // dari frontmatter, default "global"
+	Category        string // inferensi dari path file
+	TenantID        string // dari frontmatter, default "global"
+	Status          string // frontmatter status; kosong bila tidak ada
+	Confidentiality string // frontmatter confidentiality; kosong bila tidak ada
 }
 
 // EmbeddingText mereturn representasi teks chunk untuk model embedding:
@@ -167,20 +178,22 @@ func ParseDocument(relPath, src string) (Meta, []Chunk, error) {
 			title = "Overview"
 		}
 		chunks = append(chunks, Chunk{
-			SourceFile:   relPath,
-			DocID:        strings.TrimSpace(meta.ID),
-			DocTitle:     docTitle,
-			SectionTitle: title,
-			Content:      content,
-			Category:     category,
-			TenantID:     tenantID,
+			SourceFile:      relPath,
+			DocID:           strings.TrimSpace(meta.ID),
+			DocTitle:        docTitle,
+			SectionTitle:    title,
+			Content:         content,
+			Category:        category,
+			TenantID:        tenantID,
+			Status:          strings.TrimSpace(meta.Status),
+			Confidentiality: strings.TrimSpace(meta.Confidentiality),
 		})
 	}
 
 	if len(sections) == 0 {
 		// Tanpa heading H2/H3: satu chunk utuh.
 		appendChunk(docTitle, preamble)
-		return meta, chunks, nil
+		return meta, splitOversizedChunks(chunks), nil
 	}
 
 	parentH2 := ""
@@ -204,7 +217,7 @@ func ParseDocument(relPath, src string) (Meta, []Chunk, error) {
 		}
 		appendChunk(title, content)
 	}
-	return meta, chunks, nil
+	return meta, splitOversizedChunks(chunks), nil
 }
 
 // TruncateEmbeddingText memangkas teks ke MaxChunkChars dengan penanda,
@@ -222,6 +235,183 @@ func TruncateEmbeddingText(t string) string {
 
 // IsTruncated melaporkan apakah teks chunk akan terpotong sebelum embedding.
 func IsTruncated(t string) bool { return len(t) > MaxChunkChars }
+
+// splitOversizedChunks memecah chunk yang teks embedding-nya melewati
+// MaxChunkChars. Isi yang disimpan adalah potongan itu sendiri, jadi vektor
+// dan cuplikan pencarian sama-sama melihat bagian yang relevan.
+func splitOversizedChunks(chunks []Chunk) []Chunk {
+	out := make([]Chunk, 0, len(chunks))
+	for _, c := range chunks {
+		out = append(out, splitOne(c, 0)...)
+	}
+	return out
+}
+
+func splitOne(c Chunk, depth int) []Chunk {
+	c.Content = strings.TrimSpace(c.Content)
+	if c.Content == "" {
+		return nil
+	}
+	if !IsTruncated(c.EmbeddingText()) || depth > 8 {
+		return []Chunk{c}
+	}
+	budget := embeddingBudget(c.SectionTitle+strings.Repeat("x", sectionPartReserve), c)
+	parts := splitText(c.Content, budget, ChunkOverlapChars)
+	if len(parts) <= 1 {
+		parts = splitText(c.Content, budget/2, budget/10)
+	}
+	if len(parts) <= 1 {
+		return []Chunk{c}
+	}
+	out := make([]Chunk, 0, len(parts))
+	for i, p := range parts {
+		ch := c
+		ch.Content = strings.TrimSpace(p)
+		ch.SectionTitle = fitSectionTitle(c.SectionTitle, i+1, len(parts))
+		if ch.Content == "" {
+			continue
+		}
+		if IsTruncated(ch.EmbeddingText()) {
+			out = append(out, splitOne(ch, depth+1)...)
+			continue
+		}
+		out = append(out, ch)
+	}
+	return out
+}
+
+// embeddingBudget menghitung panjang isi yang masih muat di MaxChunkChars
+// setelah header embedding (path, judul, section) ditambahkan.
+func embeddingBudget(sectionTitle string, sample Chunk) int {
+	probe := sample
+	probe.SectionTitle = sectionTitle
+	probe.Content = "x"
+	headerLen := len(probe.EmbeddingText()) - 1
+	budget := MaxChunkChars - headerLen
+	if budget < 800 {
+		budget = 800
+	}
+	return budget
+}
+
+// fitSectionTitle menambahkan sufiks bagian tanpa melewati VARCHAR(255).
+func fitSectionTitle(base string, i, n int) string {
+	suffix := fmt.Sprintf(" (bagian %d/%d)", i, n)
+	maxBase := 255 - len(suffix)
+	if maxBase < 1 {
+		if len(suffix) <= 255 {
+			return suffix
+		}
+		return suffix[:255]
+	}
+	if len(base) <= maxBase {
+		return base + suffix
+	}
+	cut := maxBase
+	for cut > 0 && !utf8.RuneStart(base[cut]) {
+		cut--
+	}
+	return strings.TrimSpace(base[:cut]) + suffix
+}
+
+// splitText memotong s per anggaran byte, dengan overlap, di batas paragraf,
+// baris, atau spasi bila ada. Indeks selalu jatuh di awal rune.
+func splitText(s string, budget, overlap int) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	if budget < 200 {
+		budget = 200
+	}
+	if len(s) <= budget {
+		return []string{s}
+	}
+	if overlap < 0 || overlap >= budget/2 {
+		overlap = budget / 10
+	}
+	var parts []string
+	start := 0
+	for start < len(s) {
+		if len(s)-start <= budget {
+			rest := strings.TrimSpace(s[start:])
+			if rest != "" {
+				parts = append(parts, rest)
+			}
+			break
+		}
+		end := snapEnd(s, start, start+budget)
+		if end <= start {
+			end = runeBoundary(s, start+budget)
+		}
+		part := strings.TrimSpace(s[start:end])
+		if part != "" {
+			parts = append(parts, part)
+		}
+		next := end - overlap
+		if next <= start {
+			next = end
+		}
+		next = runeBoundaryForward(s, next)
+		if next <= start {
+			next = end
+		}
+		if next <= start {
+			next = start + 1
+			next = runeBoundaryForward(s, next)
+		}
+		start = next
+	}
+	return parts
+}
+
+func snapEnd(s string, start, end int) int {
+	if end > len(s) {
+		end = len(s)
+	}
+	end = runeBoundary(s, end)
+	floor := start + (end-start)/2
+	if floor < start {
+		floor = start
+	}
+	window := s[floor:end]
+	if i := strings.LastIndex(window, "\n\n"); i >= 0 {
+		return floor + i
+	}
+	if i := strings.LastIndex(window, "\n"); i >= 0 {
+		return floor + i
+	}
+	if i := strings.LastIndex(window, " "); i >= 0 {
+		return floor + i
+	}
+	return end
+}
+
+func runeBoundary(s string, i int) int {
+	if i > len(s) {
+		i = len(s)
+	}
+	if i < 0 {
+		return 0
+	}
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return i
+}
+
+func runeBoundaryForward(s string, i int) int {
+	if i < 0 {
+		return 0
+	}
+	if i >= len(s) {
+		return len(s)
+	}
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return i
+}
 
 // hasFrontmatter memastikan dokumen benar-benar dibuka dengan blok '---' pada
 // baris pertama, bukan horizontal rule biasa.

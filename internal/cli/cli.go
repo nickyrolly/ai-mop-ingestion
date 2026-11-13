@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"ai-mop-ingestion/internal/config"
 	"ai-mop-ingestion/internal/embedding"
@@ -25,7 +26,7 @@ import (
 	"ai-mop-ingestion/internal/store"
 )
 
-const appVersion = "v0.3.0"
+const appVersion = "v0.4.0"
 
 // Run mengeksekusi CLI dan mereturn kode keluar Unix; args tanpa nama program.
 func Run(ctx context.Context, args []string, out io.Writer) int {
@@ -63,6 +64,7 @@ Penggunaan:
   ai-mop-ingestion ingest [-dir PATH] [-v] [-force]    Ingest rekursif semua *.md
   ai-mop-ingestion search "query" [-k 3] [-json]       Pencarian hybrid (vektor + kata kunci)
                      [-tenant ID] [-category NAMA]
+                     [-status NAMA] [-confidentiality NAMA]
                      [-min-score 0.50] [-per-doc 2]
   ai-mop-ingestion version                             Tampilkan versi
 
@@ -75,7 +77,9 @@ Opsi search:
   -k N          jumlah hasil akhir (default 3, maks 50)
   -min-score X  ambang cosine 0..1 untuk hit vektor; 0 = nonaktif (default 0.50)
   -per-doc N    maksimum chunk per dokumen di hasil akhir; 0 = tanpa batas (default 2)
-  -json         keluaran JSON
+  -status NAMA          filter status frontmatter (kosong = semua)
+  -confidentiality N  filter confidentiality frontmatter (kosong = semua)
+  -json               keluaran JSON
 
 Kode keluar search: 0 ada hasil, 3 tidak ada hasil yang lolos gerbang skor.
 
@@ -222,7 +226,22 @@ func runInit(ctx context.Context, cfg config.Config, w io.Writer) int {
 	if err := st.InitSchema(ctx); err != nil {
 		return fatalf(w, "%v", err)
 	}
+	if code := ensureModel(ctx, st, cfg, w); code != 0 {
+		return code
+	}
 	fmt.Fprintf(w, "✅ Skema siap: table %q (embedding vector(%d) + index hnsw)\n", cfg.SQLTable, cfg.EmbeddingDim)
+	return 0
+}
+
+func ensureModel(ctx context.Context, st *store.Store, cfg config.Config, w io.Writer) int {
+	adopted, err := st.EnsureEmbeddingModel(ctx, cfg.OllamaModel)
+	if err != nil {
+		return fatalf(w, "%v", err)
+	}
+	if adopted {
+		fmt.Fprintf(w, "ℹ️  Index yang sudah ada dikunci ke model %s (dim=%d). Ganti model butuh tabel lain, atau kosongkan tabel dan hapus %s_meta.\n",
+			cfg.OllamaModel, cfg.EmbeddingDim, cfg.SQLTable)
+	}
 	return 0
 }
 
@@ -270,6 +289,9 @@ func runIngest(ctx context.Context, cfg config.Config, args []string, w io.Write
 	if err := st.InitSchema(ctx); err != nil {
 		return fatalf(w, "%v", err)
 	}
+	if code := ensureModel(ctx, st, cfg, w); code != 0 {
+		return code
+	}
 
 	emb := embedding.NewClient(cfg.OllamaURL, cfg.OllamaModel, cfg.EmbeddingDim)
 
@@ -288,7 +310,7 @@ func runIngest(ctx context.Context, cfg config.Config, args []string, w io.Write
 		id := sourceID(root, path)
 		fmt.Fprintf(w, "⏳ Processing %s... ", id)
 
-		res, err := ingestOne(ctx, st, emb, id, path, cfg.Jobs, *force, *verbose, w)
+		res, err := ingestOne(ctx, st, emb, id, path, cfg.OllamaModel, cfg.Jobs, *force, *verbose, w)
 		if err != nil {
 			fmt.Fprintf(w, "❌ %v\n", err)
 			stats.failed++
@@ -315,6 +337,23 @@ func runIngest(ctx context.Context, cfg config.Config, args []string, w io.Write
 	fmt.Fprintf(w, "⏱  %d file diproses, %d skip, %d gagal — %d chunk tersimpan, %d chunk di-embed dalam %s\n",
 		stats.files, stats.skipped, stats.failed, stats.chunks, stats.embedded,
 		time.Since(stats.start).Round(time.Millisecond))
+	if !canceled {
+		pruned, err := maybePrune(ctx, st, kbDir, root, files)
+		if err != nil {
+			fmt.Fprintf(w, "⚠️  prune gagal: %v\n", err)
+			stats.failed++
+		} else if pruned.Chunks > 0 {
+			names := pruned.Names
+			extra := ""
+			if len(names) > 8 {
+				extra = fmt.Sprintf(" … +%d", len(names)-8)
+				names = names[:8]
+			}
+			fmt.Fprintf(w, "🧹 %d dokumen yang sudah tidak ada di disk dihapus (%d chunk): %s%s\n",
+				pruned.Files, pruned.Chunks, strings.Join(names, ", "), extra)
+		}
+	}
+
 	if canceled {
 		return 130 // konvensi SIGINT; kegagalan file akibat cancel bukan error data
 	}
@@ -322,6 +361,39 @@ func runIngest(ctx context.Context, cfg config.Config, args []string, w io.Write
 		return 1
 	}
 	return 0
+}
+
+// maybePrune menghapus chunk milik file yang sudah tidak ada, hanya saat
+// target ingest adalah folder knowledge-base (bukan satu file atau subfolder).
+// Subfolder memakai kunci path yang berbeda, jadi prune di sana bisa menghapus
+// dokumen yang masih ada.
+func maybePrune(ctx context.Context, st *store.Store, kbDir, root string, files []string) (store.PruneStats, error) {
+	var zero store.PruneStats
+	info, err := os.Stat(kbDir)
+	if err != nil || !info.IsDir() || !pruneEligible(kbDir) || len(files) == 0 {
+		return zero, nil
+	}
+	keep := make([]string, 0, len(files))
+	for _, path := range files {
+		keep = append(keep, sourceID(root, path))
+	}
+	return st.PruneSources(ctx, keep)
+}
+
+// pruneEligible benar bila folder ini adalah root knowledge-base, yaitu tempat
+// kunci source_file dibuat relatif terhadap seluruh korpus.
+func pruneEligible(root string) bool {
+	if strings.EqualFold(filepath.Base(root), "knowledge-base") {
+		return true
+	}
+	n := 0
+	for _, sub := range []string{"runbooks", "learnings", "vendors", "patterns", "clients"} {
+		st, err := os.Stat(filepath.Join(root, sub))
+		if err == nil && st.IsDir() {
+			n++
+		}
+	}
+	return n >= 2
 }
 
 type ingestResult struct {
@@ -335,7 +407,7 @@ type ingestResult struct {
 // ingestOne memproses satu file: hash -> skip bila tidak berubah -> parse ->
 // embed (batch paralel) -> simpan dalam satu transaksi.
 func ingestOne(ctx context.Context, st *store.Store, emb *embedding.Client,
-	id, path string, jobs int, force, verbose bool, w io.Writer) (ingestResult, error) {
+	id, path, model string, jobs int, force, verbose bool, w io.Writer) (ingestResult, error) {
 
 	var res ingestResult
 	src, err := os.ReadFile(path)
@@ -345,17 +417,6 @@ func ingestOne(ctx context.Context, st *store.Store, emb *embedding.Client,
 	sum := sha256.Sum256(src)
 	hash := hex.EncodeToString(sum[:])
 
-	if !force {
-		state, err := st.FileState(ctx, id)
-		if err != nil {
-			return res, err
-		}
-		if state.Chunks > 0 && state.ContentHash == hash {
-			res.skipped = true
-			return res, nil
-		}
-	}
-
 	meta, chunks, err := markdown.ParseDocument(id, string(src))
 	if err != nil {
 		return res, fmt.Errorf("parse gagal: %w", err)
@@ -363,6 +424,20 @@ func ingestOne(ctx context.Context, st *store.Store, emb *embedding.Client,
 	if len(chunks) == 0 {
 		return res, fmt.Errorf("0 chunk (dilewati)")
 	}
+
+	if !force {
+		state, err := st.FileState(ctx, id)
+		if err != nil {
+			return res, err
+		}
+		// Jumlah chunk ikut dibandingkan supaya section yang kini dipecah
+		// tidak tertinggal sebagai satu vektor terpotong.
+		if state.Chunks > 0 && state.Chunks == len(chunks) && state.ContentHash == hash {
+			res.skipped = true
+			return res, nil
+		}
+	}
+
 	if meta.ParseWarning != "" {
 		fmt.Fprintf(w, "\n   ⚠️ frontmatter bukan YAML valid, metadata dibaca longgar: %s\n   ", meta.ParseWarning)
 	}
@@ -387,7 +462,7 @@ func ingestOne(ctx context.Context, st *store.Store, emb *embedding.Client,
 		fmt.Fprint(w, "   ")
 	}
 
-	n, err := st.IngestChunks(ctx, chunks, vecs, hash)
+	n, err := st.IngestChunks(ctx, chunks, vecs, hash, model)
 	if err != nil {
 		return res, fmt.Errorf("insert gagal: %w", err)
 	}
@@ -512,6 +587,18 @@ func runSearch(ctx context.Context, cfg config.Config, args []string, w io.Write
 			}
 		case strings.HasPrefix(a, "-category="):
 			opt.Category = strings.TrimPrefix(a, "-category=")
+		case a == "-status":
+			if v, ok := next(); ok {
+				opt.Status = v
+			}
+		case strings.HasPrefix(a, "-status="):
+			opt.Status = strings.TrimPrefix(a, "-status=")
+		case a == "-confidentiality":
+			if v, ok := next(); ok {
+				opt.Confidentiality = v
+			}
+		case strings.HasPrefix(a, "-confidentiality="):
+			opt.Confidentiality = strings.TrimPrefix(a, "-confidentiality=")
 		case a == "-json" || a == "--json":
 			asJSON = true
 		case strings.HasPrefix(a, "-"):
@@ -543,6 +630,12 @@ func runSearch(ctx context.Context, cfg config.Config, args []string, w io.Write
 		return fatalf(w, "%v", err)
 	}
 	defer st.Close()
+	if err := st.InitSchema(ctx); err != nil {
+		return fatalf(w, "%v", err)
+	}
+	if code := ensureModel(ctx, st, cfg, w); code != 0 {
+		return code
+	}
 
 	emb := embedding.NewClient(cfg.OllamaURL, cfg.OllamaModel, cfg.EmbeddingDim)
 	qvec, err := emb.Embed(ctx, query)
@@ -603,8 +696,10 @@ func printJSON(w io.Writer, query string, results []store.Result, opt store.Sear
 		DocID        string  `json:"doc_id,omitempty"`
 		DocTitle     string  `json:"doc_title,omitempty"`
 		SectionTitle string  `json:"section_title"`
-		Category     string  `json:"category,omitempty"`
-		Tenant       string  `json:"tenant_id"`
+		Category        string `json:"category,omitempty"`
+		Tenant          string `json:"tenant_id"`
+		Status          string `json:"status,omitempty"`
+		Confidentiality string `json:"confidentiality,omitempty"`
 		Snippet      string  `json:"snippet"`
 		UpdatedAt    string  `json:"updated_at"`
 	}
@@ -620,8 +715,10 @@ func printJSON(w io.Writer, query string, results []store.Result, opt store.Sear
 			DocID:        r.DocID,
 			DocTitle:     r.DocTitle,
 			SectionTitle: r.SectionTitle,
-			Category:     r.Category,
-			Tenant:       r.TenantID,
+			Category:        r.Category,
+			Tenant:          r.TenantID,
+			Status:          r.Status,
+			Confidentiality: r.Confidentiality,
 			Snippet:      snippet(r.Content),
 			UpdatedAt:    r.UpdatedAt.Format(time.RFC3339),
 		})
@@ -647,8 +744,15 @@ func round4(v float64) float64 {
 
 func snippet(s string) string {
 	s = strings.Join(strings.Fields(s), " ")
-	if len(s) > 220 {
-		s = s[:220] + "…"
+	if utf8.RuneCountInString(s) <= 220 {
+		return s
+	}
+	n := 0
+	for i := range s {
+		if n == 220 {
+			return s[:i] + "…"
+		}
+		n++
 	}
 	return s
 }
