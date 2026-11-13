@@ -5,7 +5,11 @@ package store
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"sort"
+	"strings"
 	"time"
+	"unicode"
 
 	"ai-mop-ingestion/internal/markdown"
 
@@ -14,6 +18,10 @@ import (
 	pgxvector "github.com/pgvector/pgvector-go/pgx"
 )
 
+// tableNameRe membatasi nama tabel yang boleh diinterpolasi ke SQL
+// (nama tabel tidak bisa diparametrisasi seperti nilai biasa).
+var tableNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 // Store membungkus koneksi pgx.
 type Store struct {
 	conn  *pgx.Conn
@@ -21,17 +29,67 @@ type Store struct {
 	dim   int
 }
 
-// Result satu baris hasil pencarian similarity.
+// DefaultRRFK konstanta k pada Reciprocal Rank Fusion. 60 adalah nilai baku
+// pada literatur (Cormack et al.) dan tidak perlu diubah untuk korpus kecil.
+const DefaultRRFK = 60
+
+// Result satu baris hasil pencarian.
 type Result struct {
+	ChunkID      int64 // id baris di tabel, dipakai untuk fusi dua jalur
 	SourceFile   string
+	DocID        string
+	DocTitle     string
 	SectionTitle string
 	Content      string
+	Category     string
+	TenantID     string
 	Similarity   float32 // cosine similarity 0..1 (1 - cosine_distance)
-	CreatedAt    time.Time
+	TextRank     float32 // skor ts_rank_cd jalur kata kunci; >0 berarti match teks
+	Score        float32 // skor fusi RRF (makin besar makin relevan)
+	UpdatedAt    time.Time
+}
+
+// TextMatched melaporkan apakah chunk cocok lewat jalur kata kunci (BM25-like).
+// Dipakai untuk menandai hasil dan menaikkan peringkat di dalam gerbang skor:
+// jalur kata kunci tidak boleh meloloskan chunk yang cosine-nya di bawah ambang.
+func (r Result) TextMatched() bool { return r.TextRank > 0 }
+
+// SearchOptions filter dan perilaku pencarian hybrid.
+type SearchOptions struct {
+	TopK           int     // jumlah hasil akhir (default 3)
+	Tenant         string  // kosong = semua tenant
+	Category       string  // kosong = semua kategori
+	Query          string  // teks query untuk jalur kata kunci; kosong = vektor saja
+	MinScore       float32 // ambang cosine 0..1; 0 = nonaktif
+	MaxPerDoc      int     // maksimum chunk per source_file; 0 = tanpa batas
+	CandidateLimit int     // kandidat per jalur sebelum fusi; 0 = topK*10 (min 50)
+}
+
+// normalized mengisi nilai default SearchOptions.
+func (o SearchOptions) normalized() SearchOptions {
+	if o.TopK <= 0 {
+		o.TopK = 3
+	}
+	if o.CandidateLimit <= 0 {
+		o.CandidateLimit = o.TopK * 10
+		if o.CandidateLimit < 50 {
+			o.CandidateLimit = 50
+		}
+	}
+	return o
+}
+
+// FileState ringkasan kondisi chunk satu dokumen di database.
+type FileState struct {
+	ContentHash string // hash isi file saat terakhir di-ingest
+	Chunks      int
 }
 
 // Connect membuka koneksi PostgreSQL.
 func Connect(ctx context.Context, dsn, table string, dim int) (*Store, error) {
+	if !tableNameRe.MatchString(table) {
+		return nil, fmt.Errorf("nama tabel tidak valid: %q", table)
+	}
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("koneksi PostgreSQL gagal: %w", err)
@@ -49,48 +107,100 @@ func (s *Store) Close() {
 	s.conn.Close(context.Background())
 }
 
-// InitSchema membuat extension vector, tabel, dan index HNSW (idempoten).
+// InitSchema membuat extension vector, tabel, dan index HNSW (idempoten), lalu
+// memvalidasi dimensi kolom embedding.
 func (s *Store) InitSchema(ctx context.Context) error {
-	sql := fmt.Sprintf(`
+	ddl := fmt.Sprintf(`
 CREATE EXTENSION IF NOT EXISTS vector;
 
-CREATE TABLE IF NOT EXISTS %s (
+CREATE TABLE IF NOT EXISTS %[1]s (
     id SERIAL PRIMARY KEY,
-    tenant_id VARCHAR(50) DEFAULT 'global',
+    tenant_id VARCHAR(50) NOT NULL DEFAULT 'global',
     category VARCHAR(50),
-    source_file VARCHAR(255) NOT NULL,
+    doc_id VARCHAR(100),
+    doc_title VARCHAR(255),
+    source_file VARCHAR(512) NOT NULL,
     section_title VARCHAR(255) NOT NULL,
     content TEXT NOT NULL,
-    embedding vector(%d) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    content_hash CHAR(64),
+    embedding vector(%[2]d) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_chunks_embedding
-    ON %s USING hnsw (embedding vector_cosine_ops);
-`, s.table, s.dim, s.table)
+-- migrasi untuk tabel lama (versi v0.1.0)
+ALTER TABLE %[1]s ALTER COLUMN source_file TYPE VARCHAR(512);
+ALTER TABLE %[1]s ADD COLUMN IF NOT EXISTS doc_id VARCHAR(100);
+ALTER TABLE %[1]s ADD COLUMN IF NOT EXISTS doc_title VARCHAR(255);
+ALTER TABLE %[1]s ADD COLUMN IF NOT EXISTS content_hash CHAR(64);
+ALTER TABLE %[1]s ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;
 
-	if _, err := s.conn.Exec(ctx, sql); err != nil {
+-- kolom turunan untuk jalur kata kunci (hybrid): judul dokumen diberi bobot A,
+-- heading B, isi C. regconfig harus literal/specifik supaya ekspresinya
+-- immutable (syarat generated column). 'simple' dipakai karena PostgreSQL 16
+-- tidak punya stemmer bahasa Indonesia.
+ALTER TABLE %[1]s ADD COLUMN IF NOT EXISTS content_tsv tsvector
+    GENERATED ALWAYS AS (
+        setweight(to_tsvector('simple', coalesce(doc_title, '')), 'A') ||
+        setweight(to_tsvector('simple', section_title), 'B') ||
+        setweight(to_tsvector('simple', content), 'C')
+    ) STORED;
+
+CREATE INDEX IF NOT EXISTS idx_chunks_embedding
+    ON %[1]s USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_chunks_source
+    ON %[1]s (source_file);
+CREATE INDEX IF NOT EXISTS idx_chunks_tenant_category
+    ON %[1]s (tenant_id, category);
+CREATE INDEX IF NOT EXISTS idx_chunks_tsv
+    ON %[1]s USING gin (content_tsv);
+`, s.table, s.dim)
+
+	if _, err := s.conn.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("inisialisasi skema: %w", err)
+	}
+	return s.checkDim(ctx)
+}
+
+// checkDim memastikan dimensi kolom embedding sama dengan konfigurasi. Tanpa
+// ini, perubahan EMBEDDING_DIM hanya akan gagal saat INSERT dengan pesan samar.
+func (s *Store) checkDim(ctx context.Context) error {
+	var typ string
+	err := s.conn.QueryRow(ctx, `
+		SELECT format_type(atttypid, atttypmod)
+		FROM pg_attribute
+		WHERE attrelid = $1::regclass AND attname = 'embedding'`, s.table).Scan(&typ)
+	if err != nil {
+		return fmt.Errorf("cek dimensi kolom embedding: %w", err)
+	}
+	want := fmt.Sprintf("vector(%d)", s.dim)
+	if typ != want {
+		return fmt.Errorf("dimensi embedding tidak cocok: tabel %q punya %s, konfigurasi EMBEDDING_DIM=%d (%s); "+
+			"pakai nama tabel lain (AI_MOP_TABLE) atau rebuild tabel", s.table, typ, s.dim, want)
 	}
 	return nil
 }
 
-// DeleteFile menghapus semua chunk lama dari satu source_file (untuk re-ingest
-// tanpa duplikasi), dikembalikan jumlah chunk yang dihapus.
-func (s *Store) DeleteFile(ctx context.Context, sourceFile, tenantID string) (int, error) {
-	tag, err := s.conn.Exec(ctx,
-		fmt.Sprintf(`DELETE FROM %s WHERE source_file = $1 AND tenant_id = $2`, s.table),
-		sourceFile, tenantID,
-	)
+// FileState mereturn hash dan jumlah chunk terakhir untuk satu dokumen.
+func (s *Store) FileState(ctx context.Context, sourceFile string) (FileState, error) {
+	var st FileState
+	var hash *string
+	err := s.conn.QueryRow(ctx, fmt.Sprintf(
+		`SELECT max(NULLIF(content_hash, '')), count(*) FROM %s WHERE source_file = $1`, s.table),
+		sourceFile).Scan(&hash, &st.Chunks)
 	if err != nil {
-		return 0, fmt.Errorf("hapus chunk lama %s: %w", sourceFile, err)
+		return st, fmt.Errorf("baca state %s: %w", sourceFile, err)
 	}
-	return int(tag.RowsAffected()), nil
+	if hash != nil {
+		st.ContentHash = *hash
+	}
+	return st, nil
 }
 
-// IngestChunks menyisip chunk beserta vektornya dalam satu transaksi:
-// hapus dulu chunk lama dari file yang sama, lalu insert batch.
-func (s *Store) IngestChunks(ctx context.Context, chunks []markdown.Chunk, embeddings [][]float32) (int, error) {
+// IngestChunks menyisip chunk beserta vektornya dalam satu transaksi: hapus
+// dulu semua chunk lama dari file yang sama, lalu insert batch. contentHash
+// disimpan agar ingest berikutnya bisa melewati file yang tidak berubah.
+func (s *Store) IngestChunks(ctx context.Context, chunks []markdown.Chunk, embeddings [][]float32, contentHash string) (int, error) {
 	if len(chunks) == 0 {
 		return 0, nil
 	}
@@ -105,48 +215,101 @@ func (s *Store) IngestChunks(ctx context.Context, chunks []markdown.Chunk, embed
 	}
 	defer tx.Rollback(context.Background())
 
-	src, tenant := chunks[0].SourceFile, chunks[0].TenantID
+	src := chunks[0].SourceFile
 
-	// 1. Bersihkan chunk lama dari file yang sama.
+	// 1. Bersihkan chunk lama dari file yang sama (tanpa filter tenant, supaya
+	//    perubahan tenant di frontmatter tidak meninggalkan chunk yatim).
 	if _, err := tx.Exec(ctx,
-		fmt.Sprintf(`DELETE FROM %s WHERE source_file = $1 AND tenant_id = $2`, s.table),
-		src, tenant); err != nil {
+		fmt.Sprintf(`DELETE FROM %s WHERE source_file = $1`, s.table), src); err != nil {
 		return 0, fmt.Errorf("hapus chunk lama %s: %w", src, err)
 	}
 
-	// 2. Insert batch (tanpa prepared statement — loop Exec di dalam tx).
-	insertSQL := fmt.Sprintf(`INSERT INTO %s (tenant_id, category, source_file, section_title, content, embedding)
-		VALUES ($1, $2, $3, $4, $5, $6)`, s.table)
+	// 2. Insert batch.
+	insertSQL := fmt.Sprintf(`INSERT INTO %s
+		(tenant_id, category, doc_id, doc_title, source_file, section_title, content, content_hash, embedding)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, s.table)
 	for i := range chunks {
 		vec := pgvector.NewVector(embeddings[i])
-		if _, err := tx.Exec(ctx,
-			insertSQL,
-			chunks[i].TenantID, chunks[i].Category, chunks[i].SourceFile,
-			chunks[i].SectionTitle, chunks[i].Content, vec,
+		if _, err := tx.Exec(ctx, insertSQL,
+			chunks[i].TenantID, chunks[i].Category, nullIfEmpty(chunks[i].DocID),
+			nullIfEmpty(chunks[i].DocTitle), chunks[i].SourceFile,
+			chunks[i].SectionTitle, chunks[i].Content, contentHash, vec,
 		); err != nil {
 			return 0, fmt.Errorf("insert chunk %q: %w", chunks[i].SectionTitle, err)
 		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("commit transaction: %w", err)
+		return 0, fmt.Errorf("commit transaksi: %w", err)
 	}
 	return len(chunks), nil
 }
 
-// Search mereturn top-k chunk paling mirip dengan vektor query (cosine).
-func (s *Store) Search(ctx context.Context, q []float32, topK int) ([]Result, error) {
-	vec := pgvector.NewVector(q)
+// Search menjalankan pencarian hybrid dua jalur:
+//
+//  1. vektor — cosine distance (embedding <=> query) via index HNSW;
+//  2. kata kunci — ts_rank_cd atas content_tsv (judul/heading/isi berbobot).
+//
+// Kedua peringkat digabung dengan Reciprocal Rank Fusion, lalu hasilnya
+// digerbang MinScore (khusus hit vektor) dan dibatasi MaxPerDoc chunk per
+// dokumen. Fusi begini menjaga recall semantik sambil menstabilkan query yang
+// memuat token pasti seperti "DISALLOW_FILE_MODS".
+func (s *Store) Search(ctx context.Context, q []float32, opt SearchOptions) ([]Result, error) {
+	opt = opt.normalized()
 
-	sql := fmt.Sprintf(`SELECT source_file, section_title, content,
-		1 - (embedding <=> $1) AS similarity, created_at
-		FROM %s
-		ORDER BY embedding <=> $1 ASC
-		LIMIT $2`, s.table)
-
-	rows, err := s.conn.Query(ctx, sql, vec, topK)
+	vec, err := s.vectorCandidates(ctx, q, opt)
 	if err != nil {
-		return nil, fmt.Errorf("query similarity: %w", err)
+		return nil, err
+	}
+	var txt []Result
+	if tsq := buildTSQuery(opt.Query); tsq != "" {
+		txt, err = s.textCandidates(ctx, q, opt, tsq)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return selectResults(fuseRRF(vec, txt, DefaultRRFK), opt), nil
+}
+
+// vectorCandidates mengambil kandidat terdekat secara cosine.
+func (s *Store) vectorCandidates(ctx context.Context, q []float32, opt SearchOptions) ([]Result, error) {
+	sql := fmt.Sprintf(`SELECT id, source_file, coalesce(doc_id, ''), coalesce(doc_title, ''),
+			section_title, content, coalesce(category, ''), tenant_id,
+			1 - (embedding <=> $1) AS similarity, 0::real AS text_rank, updated_at
+		FROM %s
+		WHERE ($2 = '' OR tenant_id = $2)
+		  AND ($3 = '' OR category = $3)
+		ORDER BY embedding <=> $1 ASC
+		LIMIT $4`, s.table)
+
+	return s.queryResults(ctx, sql,
+		pgvector.NewVector(q), opt.Tenant, opt.Category, opt.CandidateLimit)
+}
+
+// textCandidates mengambil kandidat dengan ts_rank_cd. Cosine tetap dihitung
+// supaya Similarity pada hasil fusi selalu bermakna (dipakai untuk gerbang
+// skor dan tampilan).
+func (s *Store) textCandidates(ctx context.Context, q []float32, opt SearchOptions, tsQuery string) ([]Result, error) {
+	sql := fmt.Sprintf(`SELECT id, source_file, coalesce(doc_id, ''), coalesce(doc_title, ''),
+			section_title, content, coalesce(category, ''), tenant_id,
+			1 - (embedding <=> $1) AS similarity,
+			ts_rank_cd(content_tsv, to_tsquery('simple', $4)) AS text_rank, updated_at
+		FROM %s
+		WHERE ($2 = '' OR tenant_id = $2)
+		  AND ($3 = '' OR category = $3)
+		  AND content_tsv @@ to_tsquery('simple', $4)
+		ORDER BY text_rank DESC, similarity DESC
+		LIMIT $5`, s.table)
+
+	return s.queryResults(ctx, sql,
+		pgvector.NewVector(q), opt.Tenant, opt.Category, tsQuery, opt.CandidateLimit)
+}
+
+// queryResults mengeksekusi query kandidat dan memetakan baris ke Result.
+func (s *Store) queryResults(ctx context.Context, sql string, args ...any) ([]Result, error) {
+	rows, err := s.conn.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query kandidat: %w", err)
 	}
 	defer rows.Close()
 
@@ -154,10 +317,13 @@ func (s *Store) Search(ctx context.Context, q []float32, topK int) ([]Result, er
 	for rows.Next() {
 		var r Result
 		var sim float64
-		if err := rows.Scan(&r.SourceFile, &r.SectionTitle, &r.Content, &sim, &r.CreatedAt); err != nil {
+		var textRank float32
+		if err := rows.Scan(&r.ChunkID, &r.SourceFile, &r.DocID, &r.DocTitle, &r.SectionTitle,
+			&r.Content, &r.Category, &r.TenantID, &sim, &textRank, &r.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan hasil: %w", err)
 		}
 		r.Similarity = float32(sim)
+		r.TextRank = textRank
 		results = append(results, r)
 	}
 	if err := rows.Err(); err != nil {
@@ -166,11 +332,124 @@ func (s *Store) Search(ctx context.Context, q []float32, topK int) ([]Result, er
 	return results, nil
 }
 
-// Count mereturn jumlah chunk untuk source_file tertentu (untuk logging re-ingest).
-func (s *Store) Count(ctx context.Context, sourceFile, tenantID string) (int, error) {
-	var n int
-	err := s.conn.QueryRow(ctx,
-		fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE source_file = $1 AND tenant_id = $2`, s.table),
-		sourceFile, tenantID).Scan(&n)
-	return n, err
+// fuseRRF menggabungkan dua peringkat dengan Reciprocal Rank Fusion:
+// skor(chunk) = Σ 1/(k + rank) untuk setiap jalur tempat chunk muncul. Chunk
+// yang muncul di kedua jalur otomatis naik, tanpa perlu menormalkan skala
+// cosine dan ts_rank_cd yang tidak sebanding.
+func fuseRRF(vec, txt []Result, k int) []Result {
+	if k <= 0 {
+		k = DefaultRRFK
+	}
+	type ranked struct {
+		res   Result
+		score float64
+	}
+	items := make([]*ranked, 0, len(vec)+len(txt))
+	pos := make(map[int64]int, len(vec)+len(txt))
+
+	merge := func(list []Result) {
+		for i := range list {
+			r := list[i]
+			j, ok := pos[r.ChunkID]
+			if !ok {
+				j = len(items)
+				pos[r.ChunkID] = j
+				items = append(items, &ranked{res: r})
+			} else if r.TextMatched() {
+				items[j].res.TextRank = r.TextRank
+			}
+			items[j].score += 1.0 / float64(k+i+1)
+		}
+	}
+	merge(vec)
+	merge(txt)
+
+	// Urut skor fusi; seri dipecah cosine lalu ChunkID agar deterministik.
+	sort.SliceStable(items, func(a, b int) bool {
+		if items[a].score != items[b].score {
+			return items[a].score > items[b].score
+		}
+		if items[a].res.Similarity != items[b].res.Similarity {
+			return items[a].res.Similarity > items[b].res.Similarity
+		}
+		return items[a].res.ChunkID < items[b].res.ChunkID
+	})
+
+	out := make([]Result, len(items))
+	for i, it := range items {
+		it.res.Score = float32(it.score)
+		out[i] = it.res
+	}
+	return out
+}
+
+// selectResults menerapkan gerbang skor, batas chunk per dokumen, dan TopK.
+// Gerbang berlaku untuk kedua jalur: hit kata kunci yang cosine-nya jauh di
+// bawah ambang hanya menambah derau (terbukti pada benchmark q01), sedangkan
+// token pasti yang benar-benar relevan hampir selalu punya cosine memadai.
+func selectResults(cands []Result, opt SearchOptions) []Result {
+	out := make([]Result, 0, opt.TopK)
+	perDoc := make(map[string]int, opt.TopK)
+	for _, r := range cands {
+		if opt.MinScore > 0 && r.Similarity < opt.MinScore {
+			continue
+		}
+		if opt.MaxPerDoc > 0 && perDoc[r.SourceFile] >= opt.MaxPerDoc {
+			continue
+		}
+		perDoc[r.SourceFile]++
+		out = append(out, r)
+		if len(out) >= opt.TopK {
+			break
+		}
+	}
+	return out
+}
+
+// stopwordsQuery dibuang dari query kata kunci: kata fungsi Indonesia muncul di
+// hampir semua dokumen sehingga OR antar-term jadi kehilangan sinyal.
+var stopwordsQuery = map[string]bool{
+	"a": true, "ada": true, "adalah": true, "apa": true, "atau": true, "bagaimana": true,
+	"bisa": true, "cara": true, "dalam": true, "dan": true, "dari": true, "dengan": true,
+	"di": true, "gak": true, "gimana": true, "ini": true, "itu": true, "jadi": true,
+	"juga": true, "kalau": true, "ke": true, "kenapa": true, "kok": true, "lagi": true,
+	"mas": true, "mau": true, "nya": true, "pada": true, "per": true, "saya": true,
+	"sebuah": true, "sudah": true, "tanpa": true, "tidak": true,
+	"untuk": true, "yang": true,
+}
+
+// buildTSQuery mengubah teks query bebas menjadi tsquery OR antar-term yang
+// aman (hanya huruf/angka/underscore, jadi tidak ada operator to_tsquery yang
+// bisa disuntikkan). String kosong berarti jalur kata kunci dilewati.
+func buildTSQuery(q string) string {
+	seen := make(map[string]bool)
+	var terms []string
+	var word strings.Builder
+
+	flush := func() {
+		w := strings.ToLower(word.String())
+		word.Reset()
+		if len(w) < 2 || stopwordsQuery[w] || seen[w] {
+			return
+		}
+		seen[w] = true
+		terms = append(terms, w)
+	}
+	for _, r := range q {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			word.WriteRune(r)
+			continue
+		}
+		flush()
+	}
+	flush()
+	return strings.Join(terms, " | ")
+}
+
+// nullIfEmpty mereturn nil untuk string kosong agar kolom nullable terisi NULL.
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
