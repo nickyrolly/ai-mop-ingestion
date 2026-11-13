@@ -21,6 +21,14 @@ KB_DIR=../ai-mop/knowledge-base ./eval/bench.py
 
 Hasil mentah: `eval/out/result.json`.
 
+Argumen tambahan untuk `search` bisa dioper lewat `RAG_ARGS`, misalnya untuk
+ablation (mematikan gerbang skor dan batas per dokumen):
+
+```sh
+RAG_ARGS="-min-score 0 -per-doc 0" KB_DIR=../ai-mop/knowledge-base ./eval/bench.py
+RAG_ARGS="-per-doc 1"             KB_DIR=../ai-mop/knowledge-base ./eval/bench.py
+```
+
 Untuk ikut mengukur graph, buat `graph.json` dengan bentuk berikut (diisi dari
 hasil `search_graph` per query), lalu:
 
@@ -52,3 +60,17 @@ itu yang akan dipakai manusia/agent saat mengandalkan pencarian literal.
   panjang cenderung menang.
 - Corpus kecil (46 dokumen / 406 chunk), jadi angka ini indikatif, bukan
   benchmark statistik.
+- Query di luar domain tidak ada di daftar ini; uji manual yang dipakai:
+  `search "resep nasi goreng spesial"` harus keluar dengan kode 3.
+
+## Hasil rujukan (v0.3.0)
+
+| Konfigurasi | Hit@1 | Hit@3 | Hit@5 | MRR |
+|---|---|---|---|---|
+| hybrid + gerbang 0.50 + `-per-doc 2` | 92.9% | 100% | 100% | 0.952 |
+| hybrid, `-min-score 0 -per-doc 0` | 92.9% | 92.9% | 92.9% | 0.929 |
+| vektor saja (v0.2.0) | 92.9% | 100% | 100% | 0.952 |
+
+Eksperimen `RAG_ARGS` penting: jalur kata kunci tanpa gerbang skor justru
+menurunkan Hit@5, karena chunk dengan cosine rendah tapi banyak kata kunci umum
+mendesak hasil yang benar keluar dari top-5 (kasus q01).

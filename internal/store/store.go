@@ -6,7 +6,10 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"sort"
+	"strings"
 	"time"
+	"unicode"
 
 	"ai-mop-ingestion/internal/markdown"
 
@@ -26,8 +29,13 @@ type Store struct {
 	dim   int
 }
 
-// Result satu baris hasil pencarian similarity.
+// DefaultRRFK konstanta k pada Reciprocal Rank Fusion. 60 adalah nilai baku
+// pada literatur (Cormack et al.) dan tidak perlu diubah untuk korpus kecil.
+const DefaultRRFK = 60
+
+// Result satu baris hasil pencarian.
 type Result struct {
+	ChunkID      int64 // id baris di tabel, dipakai untuk fusi dua jalur
 	SourceFile   string
 	DocID        string
 	DocTitle     string
@@ -36,14 +44,39 @@ type Result struct {
 	Category     string
 	TenantID     string
 	Similarity   float32 // cosine similarity 0..1 (1 - cosine_distance)
+	TextRank     float32 // skor ts_rank_cd jalur kata kunci; >0 berarti match teks
+	Score        float32 // skor fusi RRF (makin besar makin relevan)
 	UpdatedAt    time.Time
 }
 
-// SearchOptions filter opsional untuk pencarian.
+// TextMatched melaporkan apakah chunk cocok lewat jalur kata kunci (BM25-like).
+// Dipakai untuk menandai hasil dan menaikkan peringkat di dalam gerbang skor:
+// jalur kata kunci tidak boleh meloloskan chunk yang cosine-nya di bawah ambang.
+func (r Result) TextMatched() bool { return r.TextRank > 0 }
+
+// SearchOptions filter dan perilaku pencarian hybrid.
 type SearchOptions struct {
-	TopK     int
-	Tenant   string // kosong = semua tenant
-	Category string // kosong = semua kategori
+	TopK           int     // jumlah hasil akhir (default 3)
+	Tenant         string  // kosong = semua tenant
+	Category       string  // kosong = semua kategori
+	Query          string  // teks query untuk jalur kata kunci; kosong = vektor saja
+	MinScore       float32 // ambang cosine 0..1; 0 = nonaktif
+	MaxPerDoc      int     // maksimum chunk per source_file; 0 = tanpa batas
+	CandidateLimit int     // kandidat per jalur sebelum fusi; 0 = topK*10 (min 50)
+}
+
+// normalized mengisi nilai default SearchOptions.
+func (o SearchOptions) normalized() SearchOptions {
+	if o.TopK <= 0 {
+		o.TopK = 3
+	}
+	if o.CandidateLimit <= 0 {
+		o.CandidateLimit = o.TopK * 10
+		if o.CandidateLimit < 50 {
+			o.CandidateLimit = 50
+		}
+	}
+	return o
 }
 
 // FileState ringkasan kondisi chunk satu dokumen di database.
@@ -102,12 +135,25 @@ ALTER TABLE %[1]s ADD COLUMN IF NOT EXISTS doc_title VARCHAR(255);
 ALTER TABLE %[1]s ADD COLUMN IF NOT EXISTS content_hash CHAR(64);
 ALTER TABLE %[1]s ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;
 
+-- kolom turunan untuk jalur kata kunci (hybrid): judul dokumen diberi bobot A,
+-- heading B, isi C. regconfig harus literal/specifik supaya ekspresinya
+-- immutable (syarat generated column). 'simple' dipakai karena PostgreSQL 16
+-- tidak punya stemmer bahasa Indonesia.
+ALTER TABLE %[1]s ADD COLUMN IF NOT EXISTS content_tsv tsvector
+    GENERATED ALWAYS AS (
+        setweight(to_tsvector('simple', coalesce(doc_title, '')), 'A') ||
+        setweight(to_tsvector('simple', section_title), 'B') ||
+        setweight(to_tsvector('simple', content), 'C')
+    ) STORED;
+
 CREATE INDEX IF NOT EXISTS idx_chunks_embedding
     ON %[1]s USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_chunks_source
     ON %[1]s (source_file);
 CREATE INDEX IF NOT EXISTS idx_chunks_tenant_category
     ON %[1]s (tenant_id, category);
+CREATE INDEX IF NOT EXISTS idx_chunks_tsv
+    ON %[1]s USING gin (content_tsv);
 `, s.table, s.dim)
 
 	if _, err := s.conn.Exec(ctx, ddl); err != nil {
@@ -199,25 +245,71 @@ func (s *Store) IngestChunks(ctx context.Context, chunks []markdown.Chunk, embed
 	return len(chunks), nil
 }
 
-// Search mereturn top-k chunk paling mirip dengan vektor query (cosine).
+// Search menjalankan pencarian hybrid dua jalur:
+//
+//  1. vektor — cosine distance (embedding <=> query) via index HNSW;
+//  2. kata kunci — ts_rank_cd atas content_tsv (judul/heading/isi berbobot).
+//
+// Kedua peringkat digabung dengan Reciprocal Rank Fusion, lalu hasilnya
+// digerbang MinScore (khusus hit vektor) dan dibatasi MaxPerDoc chunk per
+// dokumen. Fusi begini menjaga recall semantik sambil menstabilkan query yang
+// memuat token pasti seperti "DISALLOW_FILE_MODS".
 func (s *Store) Search(ctx context.Context, q []float32, opt SearchOptions) ([]Result, error) {
-	if opt.TopK <= 0 {
-		opt.TopK = 3
-	}
-	vec := pgvector.NewVector(q)
+	opt = opt.normalized()
 
-	sql := fmt.Sprintf(`SELECT source_file, coalesce(doc_id, ''), coalesce(doc_title, ''),
+	vec, err := s.vectorCandidates(ctx, q, opt)
+	if err != nil {
+		return nil, err
+	}
+	var txt []Result
+	if tsq := buildTSQuery(opt.Query); tsq != "" {
+		txt, err = s.textCandidates(ctx, q, opt, tsq)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return selectResults(fuseRRF(vec, txt, DefaultRRFK), opt), nil
+}
+
+// vectorCandidates mengambil kandidat terdekat secara cosine.
+func (s *Store) vectorCandidates(ctx context.Context, q []float32, opt SearchOptions) ([]Result, error) {
+	sql := fmt.Sprintf(`SELECT id, source_file, coalesce(doc_id, ''), coalesce(doc_title, ''),
 			section_title, content, coalesce(category, ''), tenant_id,
-			1 - (embedding <=> $1) AS similarity, updated_at
+			1 - (embedding <=> $1) AS similarity, 0::real AS text_rank, updated_at
 		FROM %s
 		WHERE ($2 = '' OR tenant_id = $2)
 		  AND ($3 = '' OR category = $3)
 		ORDER BY embedding <=> $1 ASC
 		LIMIT $4`, s.table)
 
-	rows, err := s.conn.Query(ctx, sql, vec, opt.Tenant, opt.Category, opt.TopK)
+	return s.queryResults(ctx, sql,
+		pgvector.NewVector(q), opt.Tenant, opt.Category, opt.CandidateLimit)
+}
+
+// textCandidates mengambil kandidat dengan ts_rank_cd. Cosine tetap dihitung
+// supaya Similarity pada hasil fusi selalu bermakna (dipakai untuk gerbang
+// skor dan tampilan).
+func (s *Store) textCandidates(ctx context.Context, q []float32, opt SearchOptions, tsQuery string) ([]Result, error) {
+	sql := fmt.Sprintf(`SELECT id, source_file, coalesce(doc_id, ''), coalesce(doc_title, ''),
+			section_title, content, coalesce(category, ''), tenant_id,
+			1 - (embedding <=> $1) AS similarity,
+			ts_rank_cd(content_tsv, to_tsquery('simple', $4)) AS text_rank, updated_at
+		FROM %s
+		WHERE ($2 = '' OR tenant_id = $2)
+		  AND ($3 = '' OR category = $3)
+		  AND content_tsv @@ to_tsquery('simple', $4)
+		ORDER BY text_rank DESC, similarity DESC
+		LIMIT $5`, s.table)
+
+	return s.queryResults(ctx, sql,
+		pgvector.NewVector(q), opt.Tenant, opt.Category, tsQuery, opt.CandidateLimit)
+}
+
+// queryResults mengeksekusi query kandidat dan memetakan baris ke Result.
+func (s *Store) queryResults(ctx context.Context, sql string, args ...any) ([]Result, error) {
+	rows, err := s.conn.Query(ctx, sql, args...)
 	if err != nil {
-		return nil, fmt.Errorf("query similarity: %w", err)
+		return nil, fmt.Errorf("query kandidat: %w", err)
 	}
 	defer rows.Close()
 
@@ -225,17 +317,133 @@ func (s *Store) Search(ctx context.Context, q []float32, opt SearchOptions) ([]R
 	for rows.Next() {
 		var r Result
 		var sim float64
-		if err := rows.Scan(&r.SourceFile, &r.DocID, &r.DocTitle, &r.SectionTitle,
-			&r.Content, &r.Category, &r.TenantID, &sim, &r.UpdatedAt); err != nil {
+		var textRank float32
+		if err := rows.Scan(&r.ChunkID, &r.SourceFile, &r.DocID, &r.DocTitle, &r.SectionTitle,
+			&r.Content, &r.Category, &r.TenantID, &sim, &textRank, &r.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan hasil: %w", err)
 		}
 		r.Similarity = float32(sim)
+		r.TextRank = textRank
 		results = append(results, r)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	return results, nil
+}
+
+// fuseRRF menggabungkan dua peringkat dengan Reciprocal Rank Fusion:
+// skor(chunk) = Σ 1/(k + rank) untuk setiap jalur tempat chunk muncul. Chunk
+// yang muncul di kedua jalur otomatis naik, tanpa perlu menormalkan skala
+// cosine dan ts_rank_cd yang tidak sebanding.
+func fuseRRF(vec, txt []Result, k int) []Result {
+	if k <= 0 {
+		k = DefaultRRFK
+	}
+	type ranked struct {
+		res   Result
+		score float64
+	}
+	items := make([]*ranked, 0, len(vec)+len(txt))
+	pos := make(map[int64]int, len(vec)+len(txt))
+
+	merge := func(list []Result) {
+		for i := range list {
+			r := list[i]
+			j, ok := pos[r.ChunkID]
+			if !ok {
+				j = len(items)
+				pos[r.ChunkID] = j
+				items = append(items, &ranked{res: r})
+			} else if r.TextMatched() {
+				items[j].res.TextRank = r.TextRank
+			}
+			items[j].score += 1.0 / float64(k+i+1)
+		}
+	}
+	merge(vec)
+	merge(txt)
+
+	// Urut skor fusi; seri dipecah cosine lalu ChunkID agar deterministik.
+	sort.SliceStable(items, func(a, b int) bool {
+		if items[a].score != items[b].score {
+			return items[a].score > items[b].score
+		}
+		if items[a].res.Similarity != items[b].res.Similarity {
+			return items[a].res.Similarity > items[b].res.Similarity
+		}
+		return items[a].res.ChunkID < items[b].res.ChunkID
+	})
+
+	out := make([]Result, len(items))
+	for i, it := range items {
+		it.res.Score = float32(it.score)
+		out[i] = it.res
+	}
+	return out
+}
+
+// selectResults menerapkan gerbang skor, batas chunk per dokumen, dan TopK.
+// Gerbang berlaku untuk kedua jalur: hit kata kunci yang cosine-nya jauh di
+// bawah ambang hanya menambah derau (terbukti pada benchmark q01), sedangkan
+// token pasti yang benar-benar relevan hampir selalu punya cosine memadai.
+func selectResults(cands []Result, opt SearchOptions) []Result {
+	out := make([]Result, 0, opt.TopK)
+	perDoc := make(map[string]int, opt.TopK)
+	for _, r := range cands {
+		if opt.MinScore > 0 && r.Similarity < opt.MinScore {
+			continue
+		}
+		if opt.MaxPerDoc > 0 && perDoc[r.SourceFile] >= opt.MaxPerDoc {
+			continue
+		}
+		perDoc[r.SourceFile]++
+		out = append(out, r)
+		if len(out) >= opt.TopK {
+			break
+		}
+	}
+	return out
+}
+
+// stopwordsQuery dibuang dari query kata kunci: kata fungsi Indonesia muncul di
+// hampir semua dokumen sehingga OR antar-term jadi kehilangan sinyal.
+var stopwordsQuery = map[string]bool{
+	"a": true, "ada": true, "adalah": true, "apa": true, "atau": true, "bagaimana": true,
+	"bisa": true, "cara": true, "dalam": true, "dan": true, "dari": true, "dengan": true,
+	"di": true, "gak": true, "gimana": true, "ini": true, "itu": true, "jadi": true,
+	"juga": true, "kalau": true, "ke": true, "kenapa": true, "kok": true, "lagi": true,
+	"mas": true, "mau": true, "nya": true, "pada": true, "per": true, "saya": true,
+	"sebuah": true, "sudah": true, "tanpa": true, "tidak": true,
+	"untuk": true, "yang": true,
+}
+
+// buildTSQuery mengubah teks query bebas menjadi tsquery OR antar-term yang
+// aman (hanya huruf/angka/underscore, jadi tidak ada operator to_tsquery yang
+// bisa disuntikkan). String kosong berarti jalur kata kunci dilewati.
+func buildTSQuery(q string) string {
+	seen := make(map[string]bool)
+	var terms []string
+	var word strings.Builder
+
+	flush := func() {
+		w := strings.ToLower(word.String())
+		word.Reset()
+		if len(w) < 2 || stopwordsQuery[w] || seen[w] {
+			return
+		}
+		seen[w] = true
+		terms = append(terms, w)
+	}
+	for _, r := range q {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			word.WriteRune(r)
+			continue
+		}
+		flush()
+	}
+	flush()
+	return strings.Join(terms, " | ")
 }
 
 // nullIfEmpty mereturn nil untuk string kosong agar kolom nullable terisi NULL.

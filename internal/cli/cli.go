@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,7 +25,7 @@ import (
 	"ai-mop-ingestion/internal/store"
 )
 
-const appVersion = "v0.2.0"
+const appVersion = "v0.3.0"
 
 // Run mengeksekusi CLI dan mereturn kode keluar Unix; args tanpa nama program.
 func Run(ctx context.Context, args []string, out io.Writer) int {
@@ -60,14 +61,23 @@ func printUsage(w io.Writer) {
 Penggunaan:
   ai-mop-ingestion init [-dir .]                       Inisialisasi skema (tabel + index HNSW)
   ai-mop-ingestion ingest [-dir PATH] [-v] [-force]    Ingest rekursif semua *.md
-  ai-mop-ingestion search "query" [-k 3] [-json]       Verifikasi hasil ingestion
+  ai-mop-ingestion search "query" [-k 3] [-json]       Pencarian hybrid (vektor + kata kunci)
                      [-tenant ID] [-category NAMA]
+                     [-min-score 0.50] [-per-doc 2]
   ai-mop-ingestion version                             Tampilkan versi
 
 Opsi ingest:
   -dir PATH     folder atau satu file .md (default: knowledge-base terdekat)
   -v            log per chunk (judul, kategori, panjang teks)
   -force        re-embed walau isi file tidak berubah
+
+Opsi search:
+  -k N          jumlah hasil akhir (default 3, maks 50)
+  -min-score X  ambang cosine 0..1 untuk hit vektor; 0 = nonaktif (default 0.50)
+  -per-doc N    maksimum chunk per dokumen di hasil akhir; 0 = tanpa batas (default 2)
+  -json         keluaran JSON
+
+Kode keluar search: 0 ada hasil, 3 tidak ada hasil yang lolos gerbang skor.
 
 Konfigurasi environment variable:
   OLLAMA_URL      (default: http://localhost:11434)
@@ -459,7 +469,7 @@ func embedChunks(ctx context.Context, emb *embedding.Client, chunks []markdown.C
 func runSearch(ctx context.Context, cfg config.Config, args []string, w io.Writer) int {
 	// Flag boleh sebelum maupun setelah query; stdlib flag.Parse berhenti di
 	// arg posisi pertama, jadi scan manual semua arg.
-	opt := store.SearchOptions{TopK: 3}
+	opt := store.SearchOptions{TopK: 3, MinScore: 0.50, MaxPerDoc: 2}
 	asJSON := false
 	var qparts []string
 	for i := 0; i < len(args); i++ {
@@ -478,6 +488,18 @@ func runSearch(ctx context.Context, cfg config.Config, args []string, w io.Write
 			}
 		case strings.HasPrefix(a, "-k="):
 			fmt.Sscanf(strings.TrimPrefix(a, "-k="), "%d", &opt.TopK)
+		case a == "-min-score" || a == "--min-score":
+			if v, ok := next(); ok {
+				fmt.Sscanf(v, "%f", &opt.MinScore)
+			}
+		case strings.HasPrefix(a, "-min-score="):
+			fmt.Sscanf(strings.TrimPrefix(a, "-min-score="), "%f", &opt.MinScore)
+		case a == "-per-doc" || a == "--per-doc":
+			if v, ok := next(); ok {
+				fmt.Sscanf(v, "%d", &opt.MaxPerDoc)
+			}
+		case strings.HasPrefix(a, "-per-doc="):
+			fmt.Sscanf(strings.TrimPrefix(a, "-per-doc="), "%d", &opt.MaxPerDoc)
 		case a == "-tenant":
 			if v, ok := next(); ok {
 				opt.Tenant = v
@@ -506,6 +528,15 @@ func runSearch(ctx context.Context, cfg config.Config, args []string, w io.Write
 	if opt.TopK < 1 || opt.TopK > 50 {
 		return fatalf(w, "-k harus antara 1 dan 50 (diberikan %d)", opt.TopK)
 	}
+	if opt.MinScore < 0 || opt.MinScore > 1 {
+		return fatalf(w, "-min-score harus antara 0 dan 1 (diberikan %g)", opt.MinScore)
+	}
+	if opt.MaxPerDoc < 0 {
+		return fatalf(w, "-per-doc tidak boleh negatif")
+	}
+	// Teks query dipakai jalur kata kunci (hybrid); tanpa ini, pencarian
+	// kembali ke cosine saja.
+	opt.Query = query
 
 	st, err := store.Connect(ctx, cfg.PGDSN, cfg.SQLTable, cfg.EmbeddingDim)
 	if err != nil {
@@ -522,8 +553,18 @@ func runSearch(ctx context.Context, cfg config.Config, args []string, w io.Write
 	if err != nil {
 		return fatalf(w, "%v", err)
 	}
+	if len(res) == 0 {
+		// Bedakan "tidak ada yang relevan" dari kesalahan: agent pemanggil
+		// harus tahu kapan berhenti dan bertanya, bukan mengarang jawaban.
+		if asJSON {
+			printJSON(w, query, res, opt)
+		} else {
+			fmt.Fprintf(w, "\n🔎 %q → tidak ada dokumen relevan (ambang cosine %.2f)\n", query, opt.MinScore)
+		}
+		return 3
+	}
 	if asJSON {
-		printJSON(w, query, res)
+		printJSON(w, query, res, opt)
 	} else {
 		printResults(w, query, res)
 	}
@@ -542,15 +583,22 @@ func printResults(w io.Writer, query string, results []store.Result) {
 		if r.DocID != "" {
 			doc += " (" + r.DocID + ")"
 		}
-		fmt.Fprintf(w, "%s [%.4f] %s — §%s [%s]\n    %s\n\n",
-			rank, r.Similarity, doc, r.SectionTitle, r.Category, snippet(r.Content))
+		kw := ""
+		if r.TextMatched() {
+			kw = fmt.Sprintf(" +kata kunci %.3f", r.TextRank)
+		}
+		fmt.Fprintf(w, "%s [rrf %.4f | cosine %.4f%s] %s — §%s [%s]\n    %s\n\n",
+			rank, r.Score, r.Similarity, kw, doc, r.SectionTitle, r.Category, snippet(r.Content))
 	}
 }
 
-func printJSON(w io.Writer, query string, results []store.Result) {
+func printJSON(w io.Writer, query string, results []store.Result, opt store.SearchOptions) {
 	type resultRow struct {
 		Rank         int     `json:"rank"`
+		Score        float64 `json:"score"`
 		Similarity   float64 `json:"similarity"`
+		TextMatch    bool    `json:"text_match"`
+		TextRank     float64 `json:"text_rank,omitempty"`
 		SourceFile   string  `json:"source_file"`
 		DocID        string  `json:"doc_id,omitempty"`
 		DocTitle     string  `json:"doc_title,omitempty"`
@@ -564,7 +612,10 @@ func printJSON(w io.Writer, query string, results []store.Result) {
 	for i, r := range results {
 		rows = append(rows, resultRow{
 			Rank:         i + 1,
-			Similarity:   float64(r.Similarity),
+			Score:        round4(float64(r.Score)),
+			Similarity:   round4(float64(r.Similarity)),
+			TextMatch:    r.TextMatched(),
+			TextRank:     round4(float64(r.TextRank)),
 			SourceFile:   r.SourceFile,
 			DocID:        r.DocID,
 			DocTitle:     r.DocTitle,
@@ -576,14 +627,22 @@ func printJSON(w io.Writer, query string, results []store.Result) {
 		})
 	}
 	buf, err := json.MarshalIndent(struct {
-		Query   string      `json:"query"`
-		Results []resultRow `json:"results"`
-	}{query, rows}, "", "  ")
+		Query    string      `json:"query"`
+		Total    int         `json:"total"`
+		MinScore float64     `json:"min_score"`
+		PerDoc   int         `json:"per_doc"`
+		Results  []resultRow `json:"results"`
+	}{query, len(rows), round4(float64(opt.MinScore)), opt.MaxPerDoc, rows}, "", "  ")
 	if err != nil {
 		fmt.Fprintf(w, "error: marshal json: %v\n", err)
 		return
 	}
 	fmt.Fprintln(w, string(buf))
+}
+
+// round4 membulatkan skor agar JSON mudah dibaca dan stabil dibandingkan.
+func round4(v float64) float64 {
+	return math.Round(v*10000) / 10000
 }
 
 func snippet(s string) string {

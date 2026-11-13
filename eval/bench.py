@@ -33,6 +33,9 @@ BIN = os.environ.get("BIN", os.path.join(ROOT, "ai-mop-ingestion"))
 GRAPH_JSON = os.environ.get("GRAPH_JSON", "")
 OUT = os.environ.get("EVAL_OUT", os.path.join(HERE, "out"))
 K = int(os.environ.get("TOP_K", "5"))
+# Argumen tambahan untuk `search`, mis. RAG_ARGS="-per-doc 1" atau
+# RAG_ARGS="-min-score 0 -per-doc 0" untuk membandingkan dengan perilaku lama.
+RAG_ARGS = os.environ.get("RAG_ARGS", "").split()
 
 # id, query, dokumen jawaban (relatif terhadap knowledge-base), pola grep
 # (kata kunci yang diambil dari query itu sendiri).
@@ -70,7 +73,7 @@ QUERIES = [
 
 def rag(query):
     t0 = time.time()
-    p = subprocess.run([BIN, "search", query, "-k", str(K), "-json"],
+    p = subprocess.run([BIN, "search", query, "-k", str(K), "-json"] + RAG_ARGS,
                        capture_output=True, text=True)
     ms = (time.time() - t0) * 1000
     if p.returncode != 0:
