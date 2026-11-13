@@ -131,3 +131,21 @@ func mustWrite(t *testing.T, path, body string) {
 		t.Fatalf("write %s: %v", path, err)
 	}
 }
+
+func TestAnchor(t *testing.T) {
+	cases := map[string]string{
+		"": "",
+		"Periksa status service nginx": "Periksa status service nginx",
+		"  banyak   spasi   dan \n newline  ": "banyak spasi dan newline",
+		"Ini adalah teks yang sangat panjang sekali melebihi lima puluh karakter batas anchor": "Ini adalah teks yang sangat panjang sekali mele...",
+	}
+	for in, want := range cases {
+		got := anchor(in)
+		if got != want {
+			t.Errorf("anchor(%q) = %q, want %q", in, got, want)
+		}
+		if len(got) > 50 {
+			t.Errorf("panjang anchor > 50: %d (%q)", len(got), got)
+		}
+	}
+}

@@ -163,3 +163,37 @@ func TestSearchOptionsNormalized(t *testing.T) {
 		t.Errorf("normalized tidak boleh mengisi MinScore/MaxPerDoc: %+v", o)
 	}
 }
+
+// TestTableNameValidation memastikan sanitasi nama tabel menolak karakter berbahaya
+// seperti spasi, titik koma, kutip, tanda hubung, atau operator SQL injection.
+func TestTableNameValidation(t *testing.T) {
+	valid := []string{
+		"knowledge_chunks",
+		"knowledge_chunks_2",
+		"kb_chunks",
+		"_private_chunks",
+		"Chunks",
+	}
+	for _, name := range valid {
+		if !tableNameRe.MatchString(name) {
+			t.Errorf("nama tabel valid ditolak: %q", name)
+		}
+	}
+
+	invalid := []string{
+		"knowledge-chunks",              // tanda hubung
+		"knowledge chunks",              // spasi
+		"knowledge_chunks; DROP TABLE",  // SQL injection
+		"chunks' OR 1=1",                // kutip tunggal
+		`chunks"`,                       // kutip ganda
+		"123chunks",                     // diawali angka
+		"",                              // kosong
+		"chunks--comment",               // komentar SQL
+		"chunks/*block*/",               // komentar blok
+	}
+	for _, name := range invalid {
+		if tableNameRe.MatchString(name) {
+			t.Errorf("nama tabel tidak valid lolos: %q", name)
+		}
+	}
+}
